@@ -729,6 +729,25 @@ export class ChannelStartupService {
   }
 
   public async fetchChats(query: any) {
+    if (query?.summary === true) {
+      // Count authoritative incoming statuses. Chat counters can lag receipt events.
+      // Return only the aggregate, never message bodies, for a sidebar badge.
+      const unreadCount = await this.prismaRepository.message.count({
+        where: {
+          instanceId: this.instanceId,
+          status: 'DELIVERY_ACK',
+          AND: [
+            { key: { path: this.prismaRepository.jsonPath('fromMe'), equals: false } },
+            {
+              OR: ['@s.whatsapp.net', '@lid', '@g.us'].map((suffix) => ({
+                key: { path: this.prismaRepository.jsonPath('remoteJid'), string_ends_with: suffix },
+              })),
+            },
+          ],
+        },
+      });
+      return { unreadCount };
+    }
     const remoteJid = query?.where?.remoteJid
       ? query?.where?.remoteJid.includes('@')
         ? query.where?.remoteJid

@@ -33,7 +33,7 @@ test('MySQL pool is bounded without rewriting credentials or explicit pool setti
 });
 
 // Execute the actual service methods without importing server.module or starting WhatsApp/network workers.
-function methods(file, names) {
+function methods(file, names, dependencies = {}) {
   const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
   const members = source.statements.filter(ts.isClassDeclaration).flatMap((node) => [...node.members]);
   const selected = names.map((name) => {
@@ -44,8 +44,9 @@ function methods(file, names) {
   const js = ts.transpileModule(`class Subject { ${selected.join('\n')} }`, {
     compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
   }).outputText;
-  return new Function('Prisma', 'cuid', 'isArray', 'status', 'createJid', `${js}; return Subject.prototype;`)(
+  return new Function('Prisma', 'cuid', 'isArray', 'status', 'createJid', ...Object.keys(dependencies), `${js}; return Subject.prototype;`)(
     Prisma, randomUUID, Array.isArray, { 3: 'DELIVERY_ACK', 4: 'READ' }, (jid) => `${jid}@s.whatsapp.net`,
+    ...Object.values(dependencies),
   );
 }
 
@@ -57,6 +58,27 @@ const whatsapp = methods('src/api/integrations/channel/whatsapp/whatsapp.baileys
 const chatwoot = methods('src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts', [
   'getMessageByKeyId', 'updateChatwootMessageId',
 ]);
+
+test('image bytes, MIME and filename stay JPEG after media preparation for linked devices', async () => {
+  const sharp = require('sharp');
+  const subject = methods('src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts', ['prepareMediaMessage'], {
+    sharp, isURL: () => false, mimeTypes: require('mime-types'),
+    prepareWAMessageMedia: async (payload) => {
+      assert.equal((await sharp(payload.image).metadata()).format, 'jpeg');
+      return { imageMessage: { fileLength: payload.image.length } };
+    },
+    generateWAMessageFromContent: (_jid, message) => ({ message }),
+    InternalServerErrorException: Error,
+  });
+  const receiver = Object.assign(Object.create(subject), { client: { waUploadToServer() {} }, instance: { wuid: '123456789@s.whatsapp.net' }, logger: { error() {} } });
+  for (const format of ['png', 'webp', 'jpeg']) {
+    const bytes = await sharp({ create: { width: 20, height: 20, channels: 3, background: 'red' } }).toFormat(format).toBuffer();
+    const result = await receiver.prepareMediaMessage({ mediatype: 'image', media: bytes.toString('base64'), mimetype: `image/${format}`, fileName: `صورة.${format}`, caption: 'same caption' });
+    assert.equal(result.message.imageMessage.mimetype, 'image/jpeg');
+    assert.equal(result.message.imageMessage.fileName, 'صورة.jpg');
+    assert.equal(result.message.imageMessage.caption, 'same caption');
+  }
+});
 
 test('JSON paths follow the provider, including escaped member names', () => {
   for (const provider of ['mysql', 'postgresql', 'psql_bouncer']) {
@@ -120,6 +142,12 @@ test('MySQL/MariaDB service operations preserve data and instance isolation', as
       assert.equal(await cw.getMessageByKeyId({ instanceId: 'instance-a' }, "' OR 1=1 --"), null);
     });
 
+    await t.test('unread summary excludes outgoing, broadcast and other-instance messages', async () => {
+      await db.message.create({ data: { id: 'broadcast', instanceId: 'instance-a', key: { id: 'broadcast', remoteJid: 'status@broadcast', fromMe: false }, messageType: 'conversation', message: { conversation: 'status' }, source: 'web', status: 'DELIVERY_ACK', messageTimestamp: now } });
+      assert.deepEqual(await chats.fetchChats({ summary: true }), { unreadCount: 1 });
+      await db.message.delete({ where: { id: 'broadcast' } });
+    });
+
     await t.test('read receipt updates do not touch outgoing or other-account messages/chats', async () => {
       assert.equal(await wa.updateMessagesReadedByTimestamp(jid, now), 1);
       assert.equal((await db.message.findUnique({ where: { id: 'incoming' } })).status, 'READ');
@@ -127,6 +155,7 @@ test('MySQL/MariaDB service operations preserve data and instance isolation', as
       assert.equal((await db.message.findUnique({ where: { id: 'other-account' } })).status, 'DELIVERY_ACK');
       assert.equal((await db.chat.findUnique({ where: { id: 'chat-b' } })).unreadMessages, 9);
       assert.equal((await db.chat.findUnique({ where: { id: 'chat-a' } })).unreadMessages, 0);
+      assert.deepEqual(await chats.fetchChats({ summary: true }), { unreadCount: 0 });
     });
 
     await t.test('chat list returns newest message, JSON objects, booleans and pagination', async () => {

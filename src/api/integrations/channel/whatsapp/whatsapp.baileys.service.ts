@@ -2868,7 +2868,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         mediaInput = await sharp(imageBuffer).jpeg().toBuffer();
-        mediaMessage.fileName ??= 'image.jpg';
+        // The filename and MIME must describe the encoded bytes on every device.
+        mediaMessage.fileName = (mediaMessage.fileName?.replace(/\.[^.]*$/, '') || 'image') + '.jpg';
         mediaMessage.mimetype = 'image/jpeg';
       } else {
         mediaInput = isURL(mediaMessage.media)
@@ -2962,7 +2963,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      if (mediaMessage?.fileName) {
+      if (mediaMessage?.fileName && mediaMessage.mediatype !== 'image') {
         mimetype = mimeTypes.lookup(mediaMessage.fileName).toString();
         if (mimetype === 'application/mp4') {
           mimetype = 'video/mp4';

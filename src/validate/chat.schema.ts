@@ -189,6 +189,7 @@ export const contactValidateSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
   properties: {
+    summary: { type: 'boolean' },
     where: {
       type: 'object',
       properties: {
