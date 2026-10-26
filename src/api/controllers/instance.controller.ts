@@ -33,8 +33,16 @@ export class InstanceController {
   ) {}
 
   private readonly logger = new Logger('InstanceController');
+  private readonly deletingInstances = new Set<string>();
+  private readonly loggingOutInstances = new Set<string>();
 
   public async createInstance(instanceData: InstanceDto) {
+    if (
+      this.deletingInstances.has(instanceData.instanceName) ||
+      this.loggingOutInstances.has(instanceData.instanceName)
+    ) {
+      throw new BadRequestException('Instance deletion is in progress');
+    }
     try {
       const instance = channelController.init(instanceData, {
         configService: this.configService,
@@ -307,6 +315,9 @@ export class InstanceController {
   }
 
   public async connectToWhatsapp({ instanceName, number = null }: InstanceDto) {
+    if (this.deletingInstances.has(instanceName) || this.loggingOutInstances.has(instanceName)) {
+      throw new BadRequestException('Instance shutdown is in progress');
+    }
     try {
       const instance = this.waMonitor.waInstances[instanceName];
       const state = instance?.connectionStatus?.state;
@@ -344,6 +355,9 @@ export class InstanceController {
   }
 
   public async restartInstance({ instanceName }: InstanceDto) {
+    if (this.deletingInstances.has(instanceName) || this.loggingOutInstances.has(instanceName)) {
+      throw new BadRequestException('Instance shutdown is in progress');
+    }
     try {
       const instance = this.waMonitor.waInstances[instanceName];
       const state = instance?.connectionStatus?.state;
@@ -434,29 +448,46 @@ export class InstanceController {
   }
 
   public async logout({ instanceName }: InstanceDto) {
-    const { instance } = await this.connectionState({ instanceName });
-
-    if (instance.state === 'close') {
-      throw new BadRequestException('The "' + instanceName + '" instance is not connected');
-    }
-
+    if (this.loggingOutInstances.has(instanceName)) throw new BadRequestException('Instance logout is in progress');
+    const instance = this.waMonitor.waInstances[instanceName];
+    if (!instance) throw new BadRequestException('Instance does not exist');
+    this.loggingOutInstances.add(instanceName);
     try {
-      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      await instance.logoutInstance();
+      await this.waMonitor.cleaningUp(instanceName);
+      instance.confirmLocalLogoutCleanup?.();
 
       return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
     } catch (error) {
-      throw new InternalServerErrorException(error.toString());
+      if (error?.localShutdownComplete === true) {
+        await this.waMonitor.cleaningUp(instanceName);
+        instance.confirmLocalLogoutCleanup?.();
+      }
+      throw Object.assign(new InternalServerErrorException(error.toString()), {
+        localShutdownComplete: error?.localShutdownComplete === true,
+      });
+    } finally {
+      this.loggingOutInstances.delete(instanceName);
     }
   }
 
   public async deleteInstance({ instanceName }: InstanceDto) {
-    const { instance } = await this.connectionState({ instanceName });
+    if (this.deletingInstances.has(instanceName)) throw new BadRequestException('Instance deletion is in progress');
+    this.deletingInstances.add(instanceName);
     try {
       const waInstances = this.waMonitor.waInstances[instanceName];
+      let remoteLogoutConfirmed = false;
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
-      if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+      if (waInstances) {
+        try {
+          await this.logout({ instanceName });
+          remoteLogoutConfirmed = true;
+        } catch (error) {
+          if (error?.localShutdownComplete !== true) throw error;
+          // Explicit deletion may remove local data, but must not claim remote device revocation.
+          remoteLogoutConfirmed = false;
+        }
       }
 
       try {
@@ -468,10 +499,21 @@ export class InstanceController {
         this.logger.error(error);
       }
 
-      this.eventEmitter.emit('remove.instance', instanceName, 'inner');
-      return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
+      await this.waMonitor.removeInstanceData(instanceName);
+      return {
+        status: 'SUCCESS',
+        error: false,
+        response: {
+          message: remoteLogoutConfirmed
+            ? 'Instance deleted'
+            : 'Instance deleted locally; unlink the device from WhatsApp Linked devices to confirm remote logout',
+          remoteLogoutConfirmed,
+        },
+      };
     } catch (error) {
       throw new BadRequestException(error.toString());
+    } finally {
+      this.deletingInstances.delete(instanceName);
     }
   }
 }

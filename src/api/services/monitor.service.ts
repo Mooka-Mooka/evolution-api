@@ -39,6 +39,7 @@ export class WAMonitoringService {
   private readonly logger = new Logger('WAMonitoringService');
   public readonly waInstances: Record<string, any> = {};
   private readonly delInstanceTimeouts: Record<string, NodeJS.Timeout> = {};
+  private readonly removalOperations = new Map<string, Promise<void>>();
 
   private readonly providerSession: ProviderSession;
 
@@ -389,24 +390,32 @@ export class WAMonitoringService {
     );
   }
 
-  private removeInstance() {
-    this.eventEmitter.on('remove.instance', async (instanceName: string) => {
+  public async removeInstanceData(instanceName: string) {
+    const pending = this.removalOperations.get(instanceName);
+    if (pending) return pending;
+    const operation = (async () => {
       try {
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
-
-        this.clearDelInstanceTime(instanceName);
-
-        this.cleaningUp(instanceName);
-        this.cleaningStoreData(instanceName);
-      } finally {
-        this.logger.warn(`Instance "${instanceName}" - REMOVED`);
-      }
-
-      try {
-        delete this.waInstances[instanceName];
       } catch (error) {
         this.logger.error(error);
       }
+      this.clearDelInstanceTime(instanceName);
+      await this.cleaningUp(instanceName);
+      await this.cleaningStoreData(instanceName);
+      delete this.waInstances[instanceName];
+      this.logger.warn(`Instance "${instanceName}" - REMOVED`);
+    })();
+    this.removalOperations.set(instanceName, operation);
+    try {
+      await operation;
+    } finally {
+      this.removalOperations.delete(instanceName);
+    }
+  }
+
+  private removeInstance() {
+    this.eventEmitter.on('remove.instance', (instanceName: string) => {
+      return this.removeInstanceData(instanceName).catch((error) => this.logger.error(error));
     });
     this.eventEmitter.on('logout.instance', async (instanceName: string) => {
       try {
@@ -418,7 +427,10 @@ export class WAMonitoringService {
           this.waInstances[instanceName]?.clearCacheChatwoot();
         }
 
-        this.cleaningUp(instanceName);
+        await this.cleaningUp(instanceName);
+      } catch (error) {
+        this.logger.error(error);
+        throw error;
       } finally {
         this.logger.warn(`Instance "${instanceName}" - LOGOUT`);
       }

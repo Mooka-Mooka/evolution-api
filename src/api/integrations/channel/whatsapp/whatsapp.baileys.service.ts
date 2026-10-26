@@ -249,6 +249,14 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
+  private connectionGeneration = 0;
+  private logoutOperation: Promise<void> | null = null;
+  private credentialWrite: Promise<unknown> = Promise.resolve();
+  private authStateOperation: Promise<unknown> = Promise.resolve();
+  private connectionWrite: Promise<unknown> = Promise.resolve();
+  private connectionOperation: Promise<WASocket> | null = null;
+  private terminalCleanup: Promise<unknown> | null = null;
+  private localShutdownPending = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
@@ -265,37 +273,87 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    if (this.logoutOperation) return this.logoutOperation;
+    this.endSession = true;
+    this.localShutdownPending = true;
+    this.connectionGeneration++;
+    const client = this.client;
     this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+    this.logoutOperation = (async () => {
+      let logoutError: unknown = client?.user?.id ? undefined : new Error('Remote session is unavailable');
+      let timer: ReturnType<typeof setTimeout>;
+      try {
+        await Promise.race([
+          client?.logout('Log out instance: ' + this.instanceName),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Remote logout confirmation timed out')), 8000);
+          }),
+        ]);
+      } catch (error) {
+        logoutError = error;
+      } finally {
+        clearTimeout(timer);
+        client?.end(new Error('Instance stopped'));
+        client?.ws?.close();
+      }
 
-    this.client?.ws?.close();
+      // Finish existing credential writes before removing credentials for this session.
+      let drainTimer: ReturnType<typeof setTimeout>;
+      try {
+        await Promise.race([
+          Promise.allSettled([this.credentialWrite, this.authStateOperation, this.connectionWrite]),
+          new Promise<never>((_, reject) => {
+            drainTimer = setTimeout(() => reject(new Error('Session writes are still finishing; retry logout')), 5000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(drainTimer);
+      }
 
-    const db = this.configService.get<Database>('DATABASE');
-    const cache = this.configService.get<CacheConf>('CACHE');
-    const provider = this.configService.get<ProviderSession>('PROVIDER');
+      const db = this.configService.get<Database>('DATABASE');
+      const cache = this.configService.get<CacheConf>('CACHE');
+      const provider = this.configService.get<ProviderSession>('PROVIDER');
 
-    if (provider?.ENABLED) {
-      const authState = await this.authStateProvider.authStateProvider(this.instance.id);
+      if (provider?.ENABLED) {
+        const authState = await this.authStateProvider.authStateProvider(this.instance.id);
 
-      await authState.removeCreds();
+        await authState.removeCreds();
+      }
+
+      if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
+        const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
+
+        await authState.removeCreds();
+      }
+
+      if (db.SAVE_DATA.INSTANCE) {
+        const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
+
+        await authState.removeCreds();
+      }
+
+      await this.prismaRepository.session.deleteMany({ where: { sessionId: this.instanceId } });
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: { connectionStatus: 'close' },
+      });
+      this.stateConnection = { state: 'close' };
+      this.instance.qrcode = { count: 0 };
+      if (logoutError) {
+        throw Object.assign(new Error('Instance stopped locally; remote logout could not be confirmed'), {
+          localShutdownComplete: true,
+        });
+      }
+    })();
+    try {
+      await this.logoutOperation;
+    } finally {
+      this.logoutOperation = null;
     }
+  }
 
-    if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
-      const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
-
-      await authState.removeCreds();
-    }
-
-    if (db.SAVE_DATA.INSTANCE) {
-      const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
-
-      await authState.removeCreds();
-    }
-
-    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
-    if (sessionExists) {
-      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
-    }
+  public confirmLocalLogoutCleanup() {
+    if (this.endSession) this.localShutdownPending = false;
   }
 
   public async getProfileName() {
@@ -331,7 +389,9 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>, client = this.client) {
+    if (this.endSession || client !== this.client) return;
+    if (connection === 'open' && !client?.user?.id) return;
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -410,10 +470,10 @@ export class BaileysStartupService extends ChannelStartupService {
         ),
       );
 
-      await this.prismaRepository.instance.update({
+      await (this.connectionWrite = this.prismaRepository.instance.update({
         where: { id: this.instanceId },
         data: { connectionStatus: 'connecting' },
-      });
+      }));
     }
 
     if (connection) {
@@ -430,6 +490,9 @@ export class BaileysStartupService extends ChannelStartupService {
       if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
+        this.endSession = true;
+        this.localShutdownPending = true;
+        this.connectionGeneration++;
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -438,7 +501,7 @@ export class BaileysStartupService extends ChannelStartupService {
           disconnectionObject: JSON.stringify(lastDisconnect),
         });
 
-        await this.prismaRepository.instance.update({
+        await (this.connectionWrite = this.prismaRepository.instance.update({
           where: { id: this.instanceId },
           data: {
             connectionStatus: 'close',
@@ -446,7 +509,7 @@ export class BaileysStartupService extends ChannelStartupService {
             disconnectionReasonCode: statusCode,
             disconnectionObject: JSON.stringify(lastDisconnect),
           },
-        });
+        }));
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
           this.chatwootService.eventWhatsapp(
@@ -456,22 +519,32 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+        this.terminalCleanup = this.eventEmitter.emitAsync('logout.instance', this.instance.name, 'inner');
+        try {
+          await this.terminalCleanup;
+          this.localShutdownPending = false;
+        } finally {
+          this.terminalCleanup = null;
+        }
+        client?.ws?.close();
+        client?.end(new Error('Close connection'));
 
         this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
       }
     }
 
     if (connection === 'open') {
-      this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+      if (!client?.user?.id || this.endSession || client !== this.client) return;
+      this.instance.wuid = client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
         this.instance.profilePictureUrl = profilePic.profilePictureUrl;
       } catch {
         this.instance.profilePictureUrl = null;
       }
+      if (this.endSession || client !== this.client) return;
+      const profileName = (await this.getProfileName()) as string;
+      if (this.endSession || client !== this.client) return;
       const formattedWuid = this.instance.wuid.split('@')[0].padEnd(30, ' ');
       const formattedName = this.instance.name;
       this.logger.info(
@@ -487,15 +560,16 @@ export class BaileysStartupService extends ChannelStartupService {
       `,
       );
 
-      await this.prismaRepository.instance.update({
+      await (this.connectionWrite = this.prismaRepository.instance.update({
         where: { id: this.instanceId },
         data: {
           ownerJid: this.instance.wuid,
-          profileName: (await this.getProfileName()) as string,
+          profileName,
           profilePicUrl: this.instance.profilePictureUrl,
           connectionStatus: 'open',
         },
-      });
+      }));
+      if (this.endSession || client !== this.client) return;
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
@@ -571,7 +645,23 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async createClient(number?: string): Promise<WASocket> {
-    this.instance.authState = await this.defineAuthState();
+    if (this.connectionOperation) return this.connectionOperation;
+    const operation = this.createClientSocket(number);
+    this.connectionOperation = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.connectionOperation === operation) this.connectionOperation = null;
+    }
+  }
+
+  private async createClientSocket(number?: string): Promise<WASocket> {
+    const generation = this.connectionGeneration;
+    if (this.endSession) throw new Error('Instance is stopping');
+    const authState = this.defineAuthState();
+    this.authStateOperation = authState;
+    this.instance.authState = await authState;
+    if (this.endSession || generation !== this.connectionGeneration) throw new Error('Connection attempt superseded');
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
@@ -690,7 +780,7 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     };
 
-    this.endSession = false;
+    if (this.endSession || generation !== this.connectionGeneration) throw new Error('Connection attempt superseded');
 
     this.client = makeWASocket(socketConfig);
 
@@ -718,6 +808,11 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    if (this.logoutOperation || this.terminalCleanup || this.localShutdownPending)
+      throw new Error('Instance is stopping');
+    if (this.connectionOperation) return this.connectionOperation;
+    this.endSession = false;
+    this.connectionGeneration++;
     try {
       this.loadChatwoot();
       this.loadSettings();
@@ -1869,12 +1964,14 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process(async (events) => {
+    const client = this.client;
+    client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
-          if (!this.endSession) {
+          if (!this.endSession && client === this.client) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
+            if (this.endSession || client !== this.client) return;
 
             if (events.call) {
               const call = events.call[0];
@@ -1896,11 +1993,13 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              await this.connectionUpdate(events['connection.update'], client);
+              if (this.endSession || client !== this.client) return;
             }
 
             if (events['creds.update']) {
-              this.instance.authState.saveCreds();
+              this.credentialWrite = Promise.resolve(this.instance.authState.saveCreds());
+              await this.credentialWrite;
             }
 
             if (events['messaging-history.set']) {
