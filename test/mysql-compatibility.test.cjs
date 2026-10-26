@@ -115,6 +115,27 @@ test('MySQL/MariaDB service operations preserve data and instance isolation', as
       assert.equal(filtered[0].lastMessage.id, 'incoming');
     });
 
+    await t.test('synced chats without saved messages remain visible and instance scoped', async () => {
+      const emptyJid='123456789000@g.us';
+      await db.chat.createMany({data:[
+        {id:'empty-a',instanceId:'instance-a',remoteJid:emptyJid,name:'Synced group'},
+        {id:'empty-b',instanceId:'instance-b',remoteJid:'966599999999@s.whatsapp.net',name:'Private account'},
+      ]});
+      try {
+        const result=await chats.fetchChats({});
+        assert.equal(result.length,2);
+        const empty=result.find(c=>c.remoteJid===emptyJid);
+        assert.equal(empty.pushName,'Synced group');
+        assert.equal(empty.lastMessage,undefined);
+        assert.equal(result.some(c=>c.pushName==='Private account'),false);
+        assert.equal((await chats.fetchChats({where:{remoteJid:emptyJid}})).length,1);
+        const first=await chats.fetchChats({take:1});
+        const second=await chats.fetchChats({take:1,skip:1});
+        assert.notEqual(first[0].remoteJid,second[0].remoteJid);
+        assert.deepEqual(await chats.fetchChats({where:{remoteJid:emptyJid,messageTimestamp:{gte:new Date((now-15)*1000).toISOString(),lte:new Date((now+15)*1000).toISOString()}}}),[]);
+      } finally {await db.chat.deleteMany({where:{id:{in:['empty-a','empty-b']}}});}
+    });
+
     await t.test('label operations are atomic, literal and scoped', async () => {
       await Promise.all(['a', 'b', 'a', 'x%_!', "quote'"].map((label) => wa.addLabel(label, 'instance-a', jid)));
       let chat = await db.chat.findUnique({ where: { id: 'chat-a' } });
