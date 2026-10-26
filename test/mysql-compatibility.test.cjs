@@ -7,6 +7,31 @@ const test = require('node:test');
 const ts = require('typescript');
 const { Prisma, PrismaClient } = require('@prisma/client');
 
+function repositoryClass(Client) {
+  const code = ts.transpileModule(readFileSync('src/api/repository/repository.service.ts', 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const exports = {};
+  new Function('require', 'exports', code)((name) => {
+    if (name === '@prisma/client') return { PrismaClient: Client };
+    if (name === '@config/logger.config') return { Logger: class { info() {} warn() {} } };
+    throw new Error(`Unexpected dependency: ${name}`);
+  }, exports);
+  return exports.PrismaRepository;
+}
+
+test('MySQL pool is bounded without rewriting credentials or explicit pool settings', () => {
+  const Repository = repositoryClass(class { constructor(options) { this.options = options; } });
+  const configured = (provider, uri) => new Repository({ get: () => ({ PROVIDER: provider, CONNECTION: { URI: uri } }) });
+  const uri = 'mysql://user:p%40ss%26word@localhost:3306/test?sslaccept=strict';
+  assert.equal(configured('mysql', uri).options.datasourceUrl, uri + '&connection_limit=2&pool_timeout=30');
+  const explicit = uri + '&connection_limit=4&pool_timeout=15';
+  assert.equal(configured('mysql', explicit).options.datasourceUrl, explicit);
+  assert.equal(configured('mysql', 'mysql://localhost/test').options.datasourceUrl,
+    'mysql://localhost/test?connection_limit=2&pool_timeout=30');
+  assert.equal(configured('postgresql', 'postgresql://localhost/test').options, undefined);
+});
+
 // Execute the actual service methods without importing server.module or starting WhatsApp/network workers.
 function methods(file, names) {
   const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -47,9 +72,8 @@ test('MySQL/MariaDB service operations preserve data and instance isolation', as
   const uri = new URL(process.env.DATABASE_CONNECTION_URI);
   assert.ok(['127.0.0.1', 'localhost'].includes(uri.hostname));
   assert.match(uri.pathname, /^\/evolution_mysql_test_\d+$/);
-  const db = new PrismaClient();
-  db.isMysql = true;
-  db.jsonPath = repository.jsonPath;
+  const Repository = repositoryClass(PrismaClient);
+  const db = new Repository({ get: () => ({ PROVIDER: 'mysql', CONNECTION: { URI: process.env.DATABASE_CONNECTION_URI } }) });
   const base = {
     prismaRepository: db,
     instanceId: 'instance-a',
@@ -63,6 +87,12 @@ test('MySQL/MariaDB service operations preserve data and instance isolation', as
   const jid = '966500000001@s.whatsapp.net';
   const now = Math.floor(Date.now() / 1000);
   try {
+    await t.test('history-sized query burst reuses at most two database connections', async () => {
+      const results = await Promise.all(Array.from({ length: 400 }, () =>
+        db.$queryRaw`SELECT CONNECTION_ID() AS connectionId, SLEEP(0.005) AS waited`));
+      assert.ok(new Set(results.map(rows => String(rows[0].connectionId))).size <= 2);
+      assert.equal(results.length, 400);
+    });
     await db.instance.createMany({ data: [{ id: 'instance-a', name: 'a' }, { id: 'instance-b', name: 'b' }] });
     await db.chat.createMany({ data: [
       { id: 'chat-b', instanceId: 'instance-b', remoteJid: jid, name: 'Other account', unreadMessages: 9 },

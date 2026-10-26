@@ -3,9 +3,8 @@ import '@utils/instrumentSentry';
 
 // Now import other modules
 import { ProviderFiles } from '@api/provider/sessions';
-import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
-import { eventManager, waMonitor } from '@api/server.module';
+import { eventManager, prismaRepository, waMonitor } from '@api/server.module';
 import {
   Auth,
   configService,
@@ -41,7 +40,6 @@ async function bootstrap() {
     logger.info('Provider:Files - ON');
   }
 
-  const prismaRepository = new PrismaRepository(configService);
   await prismaRepository.onModuleInit();
 
   app.use(
