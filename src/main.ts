@@ -47,6 +47,11 @@ async function bootstrap() {
   app.use(
     cors({
       origin(requestOrigin, callback) {
+        // Server-to-server requests and direct navigation have no Origin.
+        // Skip CORS headers for them; protected routes still enforce API-key authentication.
+        if (requestOrigin === undefined) {
+          return callback(null, false);
+        }
         const { ORIGIN } = configService.get<Cors>('CORS');
         if (ORIGIN.includes('*')) {
           return callback(null, true);
