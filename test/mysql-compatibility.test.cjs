@@ -195,6 +195,32 @@ test('MySQL/MariaDB service operations preserve data and instance isolation', as
       assert.equal((await cw.getMessageByKeyId({ instanceId: 'instance-a' }, 'shared-id')).chatwootMessageId, 42);
       assert.equal((await cw.getMessageByKeyId({ instanceId: 'instance-b' }, 'shared-id')).chatwootMessageId, null);
     });
+    await t.test('large synced history can be paged within the inbox request deadline', async () => {
+      await db.instance.create({data:{id:'history-account',name:'history-account'}});
+      await db.chat.createMany({data:Array.from({length:3300},(_,i)=>({
+        id:`history-chat-${i}`,instanceId:'history-account',remoteJid:`966600${String(i).padStart(4,'0')}@s.whatsapp.net`,
+      }))});
+      for(let batch=0;batch<51;batch++) {
+        await db.message.createMany({data:Array.from({length:1000},(_,i)=>{
+          const n=batch*1000+i;
+          return {id:`history-message-${n}`,instanceId:'history-account',
+            key:{id:`history-key-${n}`,remoteJid:`966600${String(n%3300).padStart(4,'0')}@s.whatsapp.net`,fromMe:false},
+            messageType:'conversation',message:{conversation:'Synthetic history'},source:'web',messageTimestamp:now+n};
+        })});
+      }
+      const started=performance.now();
+      const result=await db.$transaction(async tx=>{
+        await tx.$executeRawUnsafe('SET SESSION max_statement_time = 15');
+        const reader=Object.assign(Object.create(channel),base,{instanceId:'history-account',prismaRepository:{isMysql:true,$queryRaw:tx.$queryRaw.bind(tx)}});
+        return reader.fetchChats({take:20});
+      },{timeout:20000});
+      const elapsed=performance.now()-started;
+      t.diagnostic(`History page query: ${Math.round(elapsed)}ms`);
+      assert.equal(result.length,20);
+      assert.equal(new Set(result.map(chat=>chat.remoteJid)).size,20);
+      assert.deepEqual(result.map(chat=>chat.lastMessage.id),Array.from({length:20},(_,i)=>`history-message-${50999-i}`));
+      assert.ok(elapsed<12000,'chat page must finish before the 12-second inbox timeout');
+    });
   } finally {
     await db.$disconnect();
   }

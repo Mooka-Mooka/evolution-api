@@ -755,7 +755,20 @@ export class ChannelStartupService {
 
     const results = this.prismaRepository.isMysql
       ? await this.prismaRepository.$queryRaw<any[]>(Prisma.sql`
-        WITH chatKeys AS (
+        WITH messageRanks AS (
+          SELECT id, JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) AS remoteJid,
+            ROW_NUMBER() OVER (
+              PARTITION BY JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid'))
+              ORDER BY messageTimestamp DESC, id DESC
+            ) AS messageRank
+          FROM \`Message\` WHERE instanceId = ${this.instanceId}
+          ${
+            query?.where?.messageTimestamp?.gte && query?.where?.messageTimestamp?.lte
+              ? Prisma.sql`AND messageTimestamp >= ${Math.floor(new Date(query.where.messageTimestamp.gte).getTime() / 1000)}
+                AND messageTimestamp <= ${Math.floor(new Date(query.where.messageTimestamp.lte).getTime() / 1000)}`
+              : Prisma.sql``
+          }
+        ), chatKeys AS (
           SELECT JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) AS remoteJid
           FROM \`Message\` WHERE instanceId = ${this.instanceId}
           UNION
@@ -789,8 +802,8 @@ export class ChannelStartupService {
               ORDER BY m.messageTimestamp DESC, m.id DESC
             ) AS rowNumber
           FROM chatKeys ck
-          LEFT JOIN \`Message\` m ON JSON_UNQUOTE(JSON_EXTRACT(m.\`key\`, '$.remoteJid')) = ck.remoteJid
-            AND m.instanceId = ${this.instanceId}
+          LEFT JOIN messageRanks mr ON mr.remoteJid = ck.remoteJid AND mr.messageRank = 1
+          LEFT JOIN \`Message\` m ON m.id = mr.id AND m.instanceId = ${this.instanceId}
           LEFT JOIN \`Contact\` c ON c.remoteJid = ck.remoteJid AND c.instanceId = ${this.instanceId}
           LEFT JOIN \`Chat\` ch ON ch.remoteJid = ck.remoteJid AND ch.instanceId = ${this.instanceId}
           WHERE ck.remoteJid IS NOT NULL
