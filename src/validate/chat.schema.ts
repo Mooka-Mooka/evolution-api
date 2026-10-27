@@ -194,7 +194,17 @@ export const contactValidateSchema: JSONSchema7 = {
       type: 'object',
       properties: {
         _id: { type: 'string', minLength: 1 },
-        pushName: { type: 'string', minLength: 1 },
+        pushName: {
+          anyOf: [
+            { type: 'string', minLength: 1 },
+            {
+              type: 'object',
+              properties: { contains: { type: 'string', minLength: 1, maxLength: 100 } },
+              required: ['contains'],
+              additionalProperties: false,
+            },
+          ],
+        },
         id: { type: 'string', minLength: 1 },
         remoteJid: { type: 'string', minLength: 1 },
       },
