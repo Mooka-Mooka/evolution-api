@@ -1761,6 +1761,9 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (findMessage && update.status !== undefined && status[update.status] !== findMessage.status) {
+            if (key.fromMe) {
+              await this.updateOutgoingMessageStatus(findMessage.id, status[update.status]);
+            }
             if (!key.fromMe && key.remoteJid) {
               readChatToUpdate[key.remoteJid] = true;
 
@@ -4827,6 +4830,22 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private async updateOutgoingMessageStatus(messageId: string, next: string): Promise<number> {
+    const stages = ['PENDING', 'SERVER_ACK', 'DELIVERY_ACK', 'READ', 'PLAYED'];
+    if (!stages.includes(next) && next !== 'ERROR') return 0;
+    const previous = next === 'ERROR' ? ['PENDING', 'SERVER_ACK'] : ['ERROR', ...stages.slice(0, stages.indexOf(next))];
+    const result = await this.prismaRepository.message.updateMany({
+      where: {
+        id: messageId,
+        instanceId: this.instanceId,
+        key: { path: this.prismaRepository.jsonPath('fromMe'), equals: true },
+        OR: [{ status: null }, { status: { in: previous } }],
+      },
+      data: { status: next },
+    });
+    return result.count;
+  }
+
   private async updateMessagesReadedByTimestamp(remoteJid: string, timestamp?: number): Promise<number> {
     if (timestamp === undefined || timestamp === null) return 0;
 
@@ -5227,6 +5246,7 @@ export class BaileysStartupService extends ChannelStartupService {
         messageType: true,
         message: true,
         messageTimestamp: true,
+        status: true,
         instanceId: true,
         source: true,
         contextInfo: true,

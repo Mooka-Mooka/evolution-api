@@ -53,7 +53,7 @@ function methods(file, names, dependencies = {}) {
 const repository = methods('src/api/repository/repository.service.ts', ['isMysql', 'jsonPath']);
 const channel = methods('src/api/services/channel.service.ts', ['fetchMessages', 'fetchChats']);
 const whatsapp = methods('src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts', [
-  'getMessage', 'updateMessagesReadedByTimestamp', 'updateChatUnreadMessages', 'addLabel', 'removeLabel',
+  'getMessage', 'fetchMessages', 'updateOutgoingMessageStatus', 'updateMessagesReadedByTimestamp', 'updateChatUnreadMessages', 'addLabel', 'removeLabel',
 ]);
 const chatwoot = methods('src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts', [
   'getMessageByKeyId', 'updateChatwootMessageId',
@@ -136,12 +136,28 @@ test('MySQL/MariaDB service operations preserve data and instance isolation', as
       const result = await chats.fetchMessages({ where: { key: { fromMe: true, remoteJid: jid } } });
       assert.deepEqual(result.messages.records.map((m) => m.id), ['outgoing']);
       assert.equal(result.messages.total, 1);
+      assert.equal(result.messages.records[0].status, 'DELIVERY_ACK');
+      const linked = await wa.fetchMessages({ where: { key: { fromMe: true, remoteJid: jid, remoteJidAlt: jid } } });
+      assert.deepEqual(linked.messages.records.map(m => [m.id, m.status]), [['outgoing', 'DELIVERY_ACK']]);
       const message = await wa.getMessage({ id: 'shared-id' }, true);
       assert.equal(message.id, 'incoming');
       assert.equal((await wa.getMessage({ id: 'shared-id' })).conversation, 'مرحبا');
       assert.equal(await cw.getMessageByKeyId({ instanceId: 'instance-a' }, "' OR 1=1 --"), null);
     });
 
+    await t.test('outgoing receipts advance atomically without changing incoming or other-instance messages', async () => {
+      assert.equal(await wa.updateOutgoingMessageStatus('outgoing', 'SERVER_ACK'), 0);
+      assert.equal(await wa.updateOutgoingMessageStatus('outgoing', 'ERROR'), 0);
+      assert.equal(await wa.updateOutgoingMessageStatus('incoming', 'READ'), 0);
+      assert.equal(await wa.updateOutgoingMessageStatus('other-account', 'READ'), 0);
+      assert.equal(await wa.updateOutgoingMessageStatus('outgoing', 'invalid'), 0);
+      await Promise.all([wa.updateOutgoingMessageStatus('outgoing', 'READ'), wa.updateOutgoingMessageStatus('outgoing', 'SERVER_ACK')]);
+      assert.equal((await db.message.findUnique({ where: { id: 'outgoing' } })).status, 'READ');
+      assert.equal(await wa.updateOutgoingMessageStatus('outgoing', 'DELIVERY_ACK'), 0);
+      await db.message.update({ where: { id: 'outgoing' }, data: { status: 'PENDING' } });
+      assert.equal(await wa.updateOutgoingMessageStatus('outgoing', 'ERROR'), 1);
+      assert.equal(await wa.updateOutgoingMessageStatus('outgoing', 'DELIVERY_ACK'), 1);
+    });
     await t.test('unread summary excludes outgoing, broadcast and other-instance messages', async () => {
       await db.message.create({ data: { id: 'broadcast', instanceId: 'instance-a', key: { id: 'broadcast', remoteJid: 'status@broadcast', fromMe: false }, messageType: 'conversation', message: { conversation: 'status' }, source: 'web', status: 'DELIVERY_ACK', messageTimestamp: now } });
       assert.deepEqual(await chats.fetchChats({ summary: true }), { unreadCount: 1 });
